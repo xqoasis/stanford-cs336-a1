@@ -163,3 +163,4 @@ cython_debug/
 *.zip
 assignment_requirement.md
 data/
+others/

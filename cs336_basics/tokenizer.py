@@ -35,60 +35,74 @@ def train_bpe(
         text = f.read()
     
     # 2. initialize vocab: all bytes(0-255) + special tokens
-    vocab = {}
-    token_id = 0
-    
-    # add all possible bytes to vocab
-    for i in range(256):
-        vocab[token_id] = bytes([i])
-        token_id += 1
-    
-    # add special tokens
+    vocab = {i: bytes([i]) for i in range(256)}
     if special_tokens:
         for special_token in special_tokens:
-            vocab[token_id] = special_token.encode('utf-8')
-            token_id += 1
+            vocab[len(vocab)] = special_token.encode('utf-8')
     
-    # 3. convert text to byte sequence, then to token sequence
-    # each byte is an initial token
-    text_bytes = text.encode('utf-8')
-    tokens = [bytes([b]) for b in text_bytes]
-    
+    # 3. Convert text to pretokens and build word frequencies
+    pretokens = pretokenize(text, special_tokens or [])
+    word_freqs = defaultdict(int)
+    for pretoken_bytes in pretokens:
+        # Skip special tokens - they shouldn't be split by BPE
+        if special_tokens and pretoken_bytes.decode('utf-8', errors='ignore') in special_tokens:
+            continue
+        # Convert each pretoken to initial byte-level tokens as a tuple (for hashing)
+        word_tokens = tuple(bytes([b]) for b in pretoken_bytes)
+        if word_tokens:
+            word_freqs[word_tokens] += 1
+
     # 4. BPE training: iterate to merge the most frequent token pairs
     merges = []
-    
-    # calculate how many merges are needed
-    # vocab_size = 256 + len(special_tokens) + num_merges
-    num_special = len(special_tokens) if special_tokens else 0
-    target_merges = vocab_size - 256 - num_special
+    target_merges = vocab_size - len(vocab)
     
     # 5. merge tokens
-    for i in range(target_merges):
+    for merge_step in range(target_merges):
         # count frequency of all adj token pairs and find most freq, add to merges
-        pair_counts = Counter(zip(tokens, tokens[1:]))
-        pair_to_merge = max(pair_counts.items(), key=lambda x: x[1])
-        merges.append(pair_to_merge)
+        pair_counts = defaultdict(int)
+        for word_tokens, freq in word_freqs.items():
+            for i in range(len(word_tokens) - 1):
+                pair_counts[(word_tokens[i], word_tokens[i + 1])] += freq
+        
+        if not pair_counts:
+            print(f"No more pairs to merge at step {merge_step}")
+            break
+            
+        # Find most frequent pair (tie-breaking: lexicographically largest)
+        max_freq = max(pair_counts.values())
+        most_frequent_pair = max(pair for pair, freq in pair_counts.items() if freq == max_freq)
+        merges.append(most_frequent_pair)
 
         # add merged token to vocab
-        merged_token = pair_to_merge[0] + pair_to_merge[1]
-        vocab[token_id] = merged_token
-        token_id += 1
+        merged_token = most_frequent_pair[0] + most_frequent_pair[1]
+        vocab[len(vocab)] = merged_token
 
-        # merge all occurrences of this pair in tokens
-        new_tokens = []
-        i = 0
-        while i < len(tokens):
-            if (i < len(tokens) - 1 and tokens[i] == pair_to_merge[0] and tokens[i + 1] == pair_to_merge[1]):
-                new_tokens.append(merged_token)
-                i += 2
+        # update all words by merging this pair (i.e. update word_freqs)
+        new_word_freqs = defaultdict(int)
+        for word_tokens, freq in word_freqs.items():
+            # Check if word contains the pair and merge it
+            if any(word_tokens[i:i+2] == most_frequent_pair for i in range(len(word_tokens) - 1)):
+                new_word = []
+                i = 0
+                while i < len(word_tokens):
+                    if (i < len(word_tokens) - 1 and 
+                        word_tokens[i:i+2] == most_frequent_pair):
+                        new_word.append(merged_token)
+                        i += 2
+                    else:
+                        new_word.append(word_tokens[i])
+                        i += 1
+                new_word_freqs[tuple(new_word)] += freq
             else:
-                new_tokens.append(tokens[i])
-                i += 1
-        tokens = new_tokens
+                new_word_freqs[word_tokens] += freq
+        
+        word_freqs = new_word_freqs
 
         # print progress
-        if (i + 1) % 1000 == 0:
-            print(f"completed {i + 1} merges")
+        if (merge_step + 1) % 1000 == 0:
+            print(f"Completed {merge_step + 1} merges")
+    
+    print(f"BPE training completed. Final vocab size: {len(vocab)}")
     return vocab, merges
 
 
@@ -104,11 +118,8 @@ def split_by_special_tokens(text: str, special_tokens: List[str]) -> List[str]:
         return [text]
     
     # Sort by length (longest first) for greedy matching
-    special_tokens_sorted = sorted(special_tokens, key=lambda x: -len(x))
-    pattern = "|".join(re.escape(tok) for tok in special_tokens_sorted)
-    parts = re.split('(' + pattern + ')', text)
-    
-    return [part for part in parts if part]  # Remove empty strings
+    pattern = "|".join(re.escape(tok) for tok in sorted(special_tokens, key=len, reverse=True))
+    return [part for part in re.split(f'({pattern})', text) if part]
 
 
 def pretokenize(text: str, special_tokens: List[str]) -> List[bytes]:
@@ -119,19 +130,19 @@ def pretokenize(text: str, special_tokens: List[str]) -> List[bytes]:
     parts = split_by_special_tokens(text, special_tokens)
     
     # GPT-2 pretokenization pattern
+    # Handle the english appr ('s, 'll, 've etc.)
+    # Make sure the space and punctuation are not split
+    # BPE for every part independently
     PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
     
     tokens_list = []
     for part in parts:
         if part in special_tokens:
             # Keep special tokens as single pretokens
-            spec_tok_bytes = part.encode('utf-8')
-            tokens_list.append(spec_tok_bytes)
+            tokens_list.append(part.encode('utf-8'))
         else:
             # Apply regex pattern to split into pretokens
-            str_tokens = regex.findall(PAT, part)
-            part_tokens = [s.encode('utf-8') for s in str_tokens]
-            tokens_list.extend(part_tokens)
+            tokens_list.extend(s.encode('utf-8') for s in regex.findall(PAT, part))
     
     return tokens_list
 
@@ -148,7 +159,7 @@ class Tokenizer:
         special_tokens: List[str] = None
     ):
         self.vocab = vocab  # {token_id: token_bytes}
-        self.id_to_token = {i: token for i, token in vocab.items()}
+        self.id_to_token = vocab
         self.token_to_id = {token: i for i, token in vocab.items()}
         
         self.merges = merges
@@ -189,11 +200,9 @@ class Tokenizer:
             i = 0
             while i < len(tokens):
                 if (i < len(tokens) - 1 and 
-                    tokens[i] == merge_pair[0] and 
-                    tokens[i + 1] == merge_pair[1]):
+                    tokens[i] == merge_pair[0] and tokens[i + 1] == merge_pair[1]):
                     # Apply this merge
-                    merged_token = merge_pair[0] + merge_pair[1]
-                    new_tokens.append(merged_token)
+                    new_tokens.append(merge_pair[0] + merge_pair[1])
                     i += 2
                 else:
                     new_tokens.append(tokens[i])
@@ -202,18 +211,8 @@ class Tokenizer:
             tokens = new_tokens
         
         # Convert to token IDs
-        token_ids = []
-        for token in tokens:
-            if token in self.token_to_id:
-                token_ids.append(self.token_to_id[token])
-            else:
-                # Fallback: split unknown token into bytes
-                for byte_val in token:
-                    byte_token = bytes([byte_val])
-                    if byte_token in self.token_to_id:
-                        token_ids.append(self.token_to_id[byte_token])
-        
-        return token_ids
+        return [self.token_to_id.get(token, self.token_to_id[bytes([token[0]])])
+                for token in tokens if token in self.token_to_id]
     
     def encode(self, text: str) -> List[int]:
         """
@@ -230,9 +229,19 @@ class Tokenizer:
         
         # 2. Apply BPE to each pretoken independently
         all_token_ids = []
-        for pretoken in pretokens:
-            token_ids = self._apply_bpe_to_pretoken(pretoken)
-            all_token_ids.extend(token_ids)
+        for pretoken_bytes in pretokens:
+            # Handle special tokens
+            try:
+                pretoken_str = pretoken_bytes.decode('utf-8')
+                if self.special_tokens and pretoken_str in self.special_tokens:
+                    # Special token - add its ID directly
+                    if pretoken_str in self.special_token_ids:
+                        all_token_ids.append(self.special_token_ids[pretoken_str])
+                    continue
+            except UnicodeDecodeError:
+                pass  # Not a valid string, proceed with BPE
+            
+            all_token_ids.extend(self._apply_bpe_to_pretoken(pretoken_bytes))
         
         return all_token_ids
     
@@ -247,26 +256,8 @@ class Tokenizer:
             decoded text string
         """
         # convert token id to byte sequence
-        byte_sequence = b""
-        
-        for token_id in token_ids:
-            if token_id in self.id_to_token:
-                token_bytes = self.id_to_token[token_id]
-                byte_sequence += token_bytes
-            else:
-                # handle unknown token id
-                print(f"warning: unknown token id {token_id}")
-                continue
-        
-        # decode byte sequence to string
-        try:
-            text = byte_sequence.decode('utf-8')
-        except UnicodeDecodeError:
-            # if decoding fails, use error handling strategy
-            text = byte_sequence.decode('utf-8', errors='replace')
-            print("warning: Unicode error during decoding")
-        
-        return text
+        byte_sequence = b''.join(self.id_to_token.get(token_id, b'') for token_id in token_ids)
+        return byte_sequence.decode('utf-8', errors='replace')
     
     def get_vocab_size(self) -> int:
         """return vocab size"""
@@ -291,9 +282,7 @@ class Tokenizer:
             int: yield token id one by one
         """
         for line in text_iterable:
-            token_ids = self.encode(line)
-            for token_id in token_ids:
-                yield token_id
+            yield from self.encode(line)
 
 
 # test function
