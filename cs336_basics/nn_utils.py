@@ -914,3 +914,121 @@ def run_transformer_lm(
     
     # Run forward pass
     return model(input_ids)
+
+def cross_entropy_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """
+    Compute cross-entropy loss between logits and targets with numerical stability.
+    Cross-entropy loss formula: ℓ_i = -log(softmax(o_i)[x_{i+1}])
+
+    Args:
+        logits: Unnormalized logits of shape (..., vocab_size)
+        targets: Target class indices of shape (...)
+        
+    Returns:
+        Average cross-entropy loss across all examples (scalar)
+    """
+    # Get the shape information
+    *batch_dims, vocab_size = logits.shape
+    batch_size = logits.numel() // vocab_size
+    # Flatten to (batch_size, vocab_size) for easier processing
+    logits_flat = logits.view(batch_size, vocab_size)
+    targets_flat = targets.view(batch_size)
+
+    # step 1: substract max for numerical stability
+    # max_logits shape: (batch_size, 1)
+    max_logits = torch.max(logits_flat, dim=1, keepdim=True)[0]
+    logits_stable = logits_flat - max_logits
+
+    # step 2: compute log softmax
+    # log_softmax(x_i) = x_i - max(x) - log(sum(exp(x_j - max(x))))
+    exp_logits = torch.exp(logits_stable)
+    sum_exp = torch.sum(exp_logits, dim=1, keepdim=True)
+    log_sum_exp = torch.log(sum_exp)
+
+    # log_softmax = logits_stable - log_sum_exp
+    log_softmax = logits_stable - log_sum_exp
+
+    # step 3: gather the log probabilities of the targets
+    # use advanced indexing to get log_softmax[i, targets[i]] for each i
+    target_log_probs = log_softmax[torch.arange(batch_size), targets_flat]
+
+    # step 4: compute negative log likelihood loss
+    losses = -target_log_probs
+
+    return torch.mean(losses)
+
+
+def gradient_clipping(parameters, max_l2_norm:float) -> None:
+    """
+    clip gradients to have L2 norm at most max_l2_norm.
+
+    This prevents gradient explosion by scaling down gradients when their
+    combined L2 norm exceeds the threshold.
+
+    Args:
+        parmeters: Iterable of parameters with .grad attributes
+        max_l2_norm: Max allowed L2 norm of gradients
+    """
+    # Collect all gradients
+    gradients = []
+    for param in parameters:
+        if param.grad is not None:
+            gradients.append(param.grad.view(-1)) # Flatten each gradient
+    
+    if not gradients:
+        return # No gradients ot clip
+    
+    # Concatenate all gradients into a single vector
+    all_gradients = torch.cat(gradients)
+
+    # Compute L2 norm of all gradients combined
+    # global l2 norm: sqrt(sum(g_i^2))
+    total_norm = torch.norm(all_gradients, p=2)
+
+    # Compute clipping factor (i.e. scaling factor)
+    clip_factor = max_l2_norm / (total_norm + 1e-8) # Add small epsilon to avoid division by zero
+
+    # only clip if the norm exceeds the threshold
+    if clip_factor < 1.0:
+        # Scale down all gradients by the same factor
+        # only change the gradient's magnitude, without changing the direction
+        for param in parameters:
+            if param.grad is not None:
+                param.grad.data.mul_(clip_factor)
+
+def get_lr_cosine_schedule(
+        it: int,
+        max_learning_rate: float,
+        min_learning_rate: float,
+        warmup_iters: int,
+        cosine_cycle_iters: int,
+    ) -> float:
+    """
+    Cosine learning rate schedule with linear warmup.
+    
+    The schedule has three phases:
+    1. Linear warmup: [0, warmup_iters) - linearly increase from 0 to max_lr
+    2. Cosine annealing: [warmup_iters, cosine_cycle_iters) - 
+       cosine decay from max_lr to min_lr
+    3. Constant: [cosine_cycle_iters, inf) - stay at min_lr
+    
+    Args:
+        it: Current iteration number
+        max_learning_rate: α_max, maximum learning rate
+        min_learning_rate: α_min, minimum learning rate
+        warmup_iters: T_w, number of warmup iterations
+        cosine_cycle_iters: T_c, number of cosine annealing iterations
+        
+    Returns:
+        Learning rate at iteration it
+    """
+    import math
+    # p1: linear warmup
+    if it < warmup_iters:
+        return max_learning_rate * it / warmup_iters
+    elif it < cosine_cycle_iters:
+        progress = (it - warmup_iters) / (cosine_cycle_iters - warmup_iters)
+        cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
+        return min_learning_rate + (max_learning_rate - min_learning_rate) * cosine_factor
+    else:
+        return min_learning_rate
