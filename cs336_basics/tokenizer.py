@@ -14,10 +14,10 @@ from typing import List, Dict, Tuple, Optional, Union
 
 
 def train_bpe(
-    corpus_path: Union[str, os.PathLike],
-    vocab_size: int,
-    special_tokens: List[str] = None
-) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]:
+        corpus_path: Union[str, os.PathLike],
+        vocab_size: int,
+        special_tokens: List[str] = None
+    ) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]:
     """
     train BPE tokenizer
     
@@ -54,6 +54,7 @@ def train_bpe(
 
     # 4. BPE training: iterate to merge the most frequent token pairs
     merges = []
+    # calculate target merges
     target_merges = vocab_size - len(vocab)
     
     # 5. merge tokens

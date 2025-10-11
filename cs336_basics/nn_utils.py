@@ -1,499 +1,16 @@
 import torch
 from torch import nn
+from cs336_basics import linear, embedding, rmsnorm, swiglu, rope, mha, transformer, attention
+from cs336_basics.training_utils import (
+    cross_entropy_loss,
+    gradient_clipping,
+    get_lr_cosine_schedule,
+    get_batch,
+    save_checkpoint,
+    load_checkpoint
+)
 from jaxtyping import Float, Int
 from torch import Tensor
-
-class Linear(nn.Module):
-    """Linear layer implementation from scratch (without bias)
-    
-    Matches PyTorch's nn.Linear interface except for the absence of bias.
-    """
-    def __init__(self, in_features: int, out_features: int, device=None, dtype=None):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-
-        # Create weight parameter W (not W^T) for memory ordering reasons
-        # Shape: (out_features, in_features) to match PyTorch's nn.Linear
-        self.weight = nn.Parameter(
-            torch.empty(out_features, in_features, device=device, dtype=dtype)
-        )
-        
-        # Initialize weights using truncated normal distribution
-        self.reset_parameters()
-            
-    def reset_parameters(self):
-        """Initialize parameters using truncated normal distribution"""
-        torch.nn.init.trunc_normal_(self.weight)
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the linear layer
-        
-        Args:
-            x: Input tensor of shape (..., in_features)
-            
-        Returns:
-            Output tensor of shape (..., out_features)
-        """
-        # Linear transformation: x @ W^T (where W is stored as (out_features, in_features))
-        return torch.nn.functional.linear(x, self.weight, bias=None)
-
-class Embedding(nn.Module):
-    """Embedding layer implementation from scratch
-    """
-    def __init__(self, num_embeddings: int, embedding_dim: int, device=None, dtype=None):
-        """
-        Construct an embedding module. This function should accept the following parameters:
-        - num_embeddings (int): Size of the vocabulary
-        - embedding_dim (int): Dimension of the embedding vectors
-        - device (torch.device, optional): Device to store the parameters on
-        - dtype (torch.dtype, optional): Data type of the parameters
-        """
-        super().__init__()
-        self.num_embeddings = num_embeddings
-        self.embedding_dim = embedding_dim
-        
-        # Create embedding weight matrix with shape (num_embeddings, embedding_dim)
-        # This stores d_model as the final dimension as required
-        self.weight = nn.Parameter(
-            torch.empty(num_embeddings, embedding_dim, device=device, dtype=dtype)
-        )
-        
-        # Initialize weights using truncated normal distribution
-        self.reset_parameters()
-    
-    def reset_parameters(self):
-        """Initialize parameters using truncated normal distribution"""
-        torch.nn.init.trunc_normal_(self.weight)
-        
-    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Look up the embeddings for the given token IDs
-        
-        Args:
-            token_ids: Token IDs tensor of shape (batch_size, sequence_length) or any shape
-            
-        Returns:
-            Embedding vectors of shape (*token_ids.shape, embedding_dim)
-        """
-        # Use advanced indexing to lookup embeddings
-        # token_ids should contain indices into the vocabulary
-        return self.weight[token_ids]
-
-
-class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization implementation
-    
-    RMSNorm normalizes the input using root mean square instead of variance.
-    """
-    def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None):
-        super().__init__()
-        self.d_model = d_model
-        self.eps = eps
-        
-        # Learnable scale parameter
-        self.weight = nn.Parameter(
-            torch.ones(d_model, device=device, dtype=dtype)
-        )
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Apply RMSNorm to the input tensor
-        
-        Args:
-            x: Input tensor of shape (..., d_model)
-            
-        Returns:
-            Normalized tensor of the same shape
-        """
-        # Compute RMS along the last dimension
-        # RMS = sqrt(mean(x^2))
-        rms = torch.sqrt(torch.mean(x.pow(2), dim=-1, keepdim=True) + self.eps)
-        
-        # Normalize and scale
-        return x / rms * self.weight
-
-
-class SwiGLU(nn.Module):
-    """SwiGLU Feed-Forward Network
-    
-    SwiGLU is a variant of GLU (Gated Linear Unit) that uses SiLU activation.
-    Formula: SwiGLU(x) = (W1(x) ⊙ SiLU(W3(x))) @ W2
-    """
-    def __init__(self, d_model: int, d_ff: int, device=None, dtype=None):
-        super().__init__()
-        self.d_model = d_model
-        self.d_ff = d_ff
-
-        # Three linear transformations
-        self.w1 = Linear(d_model, d_ff, device=device, dtype=dtype)  # Gate projection
-        self.w2 = Linear(d_ff, d_model, device=device, dtype=dtype)  # Down projection
-        self.w3 = Linear(d_model, d_ff, device=device, dtype=dtype)  # Up projection
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Apply SwiGLU transformation
-        
-        Args:
-            x: Input tensor of shape (..., d_model)
-            
-        Returns:
-            Output tensor of shape (..., d_model)
-        """
-        # SwiGLU formula: (SiLU(W1(x)) ⊙ W3(x)) @ W2
-        up = self.w1(x)  # (..., d_ff)  
-        gate = self.w3(x)    # (..., d_ff)
-
-        silu_up = up * torch.sigmoid(up)  # SiLU activation: x * sigmoid(x)
-        gated = silu_up * gate  # Element-wise multiplication
-        return self.w2(gated)   # (..., d_model)
-
-class RotaryPositionEmbedding(nn.Module):
-    """Rotary Position Embeddings (RoPE) implementation
-    
-    RoPE rotates query and key vectors by position-dependent angles to inject
-    positional information into the attention mechanism.
-    """
-    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
-        """
-        Construct the RoPE module and create buffers if needed.
-
-        Args:
-            theta: Θ value for the RoPE
-            d_k: dimension of query and key vectors
-            max_seq_len: Maximum sequence length that will be inputted
-            device: Device to store the buffer on
-        """
-        super().__init__()
-        self.theta = theta
-        self.d_k = d_k
-        self.max_seq_len = max_seq_len
-
-        # Pre-compute frequency values for efficient computation
-        # freq_k = theta^(-2k/d_k) for k in {0, 1, ..., d_k/2 - 1}
-        k_values = torch.arange(0, d_k // 2, dtype=torch.float, device=device)
-        freqs = theta ** (-2 * k_values / d_k ) # (d_k/2,)
-
-        # Create position tensor for all possible positions
-        positions = torch.arange(max_seq_len, dtype=torch.float, device=device) #(max_seq_len,)
-
-        # Compute all possible angles:position * freq
-        # angles[i, k] = position_i * freq_k
-        angles = torch.outer(positions, freqs) #(max_seq_len, d_k/2)
-
-        # Pre-compute cos and sin values
-        cos_vals = torch.cos(angles) #(max_seq_len, d_k/2)
-        sin_vals = torch.sin(angles) #(max_seq_len, d_k/2)
-        
-        # Create buffers for position indices and rotation angles
-        self.register_buffer('cos_vals', cos_vals, persistent=False)
-        self.register_buffer('sin_vals', sin_vals, persistent=False)
-
-    def forward(self, x: torch.Tensor, token_positions: torch.Tensor):
-        """
-        Process an input tensor and apply RoPE.
-        
-        Args:
-            x: Input tensor of shape (..., seq_len, d_k)
-            token_positions: Token positions of shape (..., seq_len)
-            
-        Returns:
-            Tensor of the same shape as x with RoPE applied
-        """
-        # Get the shape info
-        *batch_dims, seq_len, d_k = x.shape
-        
-        # Reshape x to separate even and odd dimensions
-        # x: (..., seq_len, d_k) -> (..., seq_len, d_k/2, 2)
-        x_reshaped = x.view(*batch_dims, seq_len, d_k // 2, 2)
-        
-        # Extract even and odd elements
-        x_even = x_reshaped[..., 0]  # (..., seq_len, d_k/2) - positions 0, 2, 4, ...
-        x_odd = x_reshaped[..., 1]   # (..., seq_len, d_k/2) - positions 1, 3, 5, ...
-        
-        # Get cos and sin values for the token positions (descrete positions to interpolate)
-        # token_positions: (..., seq_len)
-        cos = self.cos_vals[token_positions]  # (..., seq_len, d_k/2)
-        sin = self.sin_vals[token_positions]  # (..., seq_len, d_k/2)
-        
-        # Apply rotation: 
-        # [x_even'] = [cos  -sin] [x_even]
-        # [x_odd' ]   [sin   cos] [x_odd ]
-        x_even_rotated = x_even * cos - x_odd * sin
-        x_odd_rotated = x_even * sin + x_odd * cos
-        
-        # Combine back
-        x_rotated = torch.stack([x_even_rotated, x_odd_rotated], dim=-1)  # (..., seq_len, d_k/2, 2)
-        
-        # Reshape back to original shape
-        x_rotated = x_rotated.view(*batch_dims, seq_len, d_k)
-        
-        return x_rotated      
-
-def scaled_dot_product_attention(
-        Q: torch.Tensor, 
-        K: torch.Tensor, 
-        V: torch.Tensor, 
-        mask: torch.Tensor = None
-    ) -> torch.Tensor:
-    """
-    Scaled Dot-Product Attention implementation
-    
-    Args:
-        Q: Query tensor of shape (..., seq_len_q, d_k)
-        K: Key tensor of shape (..., seq_len_k, d_k)
-        V: Value tensor of shape (..., seq_len_v, d_v)
-        mask: Optional mask tensor of shape (..., seq_len_q, seq_len_k)
-        
-    Returns:
-        Attention output of shape (..., seq_len_q, d_v)
-    """
-    # Get the dimensionality for scaling
-    d_k = Q.size(-1)
-
-    # Compute attention scores: Q @ K^T / sqrt(d_k)
-    # torch.tensor(d_k, dtype=Q.dtype, device=Q.device) is to ensure the dtype and device are the same as Q
-    scores = torch.matmul(Q, K.transpose(-2, -1)) / torch.sqrt(torch.tensor(d_k, dtype=Q.dtype, device=Q.device))
-    
-    # Apply mask if provided (set masked positions to large negative value)
-    # mask before softmax
-    if mask is not None:
-        scores = scores.masked_fill(mask == 0, float('-inf'))
-    # Apply softmax to get attention weights
-    attention_weights = run_softmax(scores, dim = -1)
-    # Apply attention weights to values
-    output = torch.matmul(attention_weights, V)
-    
-    return output
-
-
-class MultiHeadSelfAttention(nn.Module):
-    """Causal Multi-Head Self-Attention implementation with RoPE support"""
-    
-    def __init__(self, d_model: int, num_heads: int, max_seq_len: int = 2048, 
-                 theta: float = 10000.0, use_rope: bool = True, device=None, dtype=None):
-        super().__init__()
-        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
-        
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.d_k = d_model // num_heads
-        self.use_rope = use_rope
-        
-        # Linear projections for Q, K, V (all heads combined)
-        self.q_proj = Linear(d_model, d_model, device=device, dtype=dtype)
-        self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
-        self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
-        
-        # Output projection
-        self.output_proj = Linear(d_model, d_model, device=device, dtype=dtype)
-        
-        # RoPE for positional encoding
-        if use_rope:
-            self.rope = RotaryPositionEmbedding(
-                theta=theta, 
-                d_k=self.d_k, 
-                max_seq_len=max_seq_len, 
-                device=device
-            )
-    
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None, 
-                token_positions: torch.Tensor = None) -> torch.Tensor:
-        """
-        Apply causal multi-head self-attention with optional RoPE
-        
-        Args:
-            x: Input tensor of shape (batch_size, seq_len, d_model)
-            mask: Optional attention mask of shape (seq_len, seq_len) or (batch_size, seq_len, seq_len)
-                 If None, a causal mask will be automatically created
-            token_positions: Optional token positions for RoPE, shape (batch_size, seq_len)
-                           If None and RoPE is enabled, will use range(seq_len)
-            
-        Returns:
-            Output tensor of shape (batch_size, seq_len, d_model)
-        """
-        batch_size, seq_len, d_model = x.shape
-        
-        # Generate causal mask if none provided
-        if mask is None:
-            # Create causal mask: lower triangular matrix
-            mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool))
-        
-        # Handle mask dimensions
-        if mask.dim() == 2:  # (seq_len, seq_len)
-            mask = mask.unsqueeze(0).expand(batch_size, seq_len, seq_len)
-        
-        # Generate token positions for RoPE if needed
-        if self.use_rope and token_positions is None:
-            token_positions = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, seq_len)
-        
-        # Project to Q, K, V
-        Q = self.q_proj(x)  # (batch_size, seq_len, d_model)
-        K = self.k_proj(x)  # (batch_size, seq_len, d_model)
-        V = self.v_proj(x)  # (batch_size, seq_len, d_model)
-        
-        # Reshape and transpose for multi-head attention
-        # Split d_model into num_heads * d_k
-        Q = Q.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)  # (batch_size, num_heads, seq_len, d_k)
-        K = K.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)  # (batch_size, num_heads, seq_len, d_k)
-        V = V.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)  # (batch_size, num_heads, seq_len, d_k)
-        
-        # Apply RoPE to Q and K (not V)
-        if self.use_rope:
-            # Expand token_positions for multi-head
-            rope_positions = token_positions.unsqueeze(1).expand(batch_size, self.num_heads, seq_len)
-            Q = self.rope(Q, rope_positions)
-            K = self.rope(K, rope_positions)
-        
-        # Expand mask for multi-head attention
-        # mask: (batch_size, seq_len, seq_len) -> (batch_size, num_heads, seq_len, seq_len)
-        mask = mask.unsqueeze(1).expand(batch_size, self.num_heads, seq_len, seq_len)
-        
-        # Apply scaled dot-product attention
-        attention_output = scaled_dot_product_attention(Q, K, V, mask)  # (batch_size, num_heads, seq_len, d_k)
-        
-        # Reshape back to concatenate heads
-        attention_output = attention_output.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
-        
-        # Apply output projection
-        output = self.output_proj(attention_output)
-        
-        return output
-
-
-class TransformerBlock(nn.Module):
-    """Pre-Norm Transformer Block
-    
-    Architecture:
-    1. Layer norm -> Multi-head self-attention -> Residual connection
-    2. Layer norm -> Feed-forward network -> Residual connection
-    """
-    
-    def __init__(self, d_model: int, num_heads: int, d_ff: int, eps: float = 1e-5, 
-                 max_seq_len: int = 2048, theta: float = 10000.0, use_rope: bool = True,
-                 device=None, dtype=None):
-        super().__init__()
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.d_ff = d_ff
-        
-        # Layer normalization (RMSNorm)
-        self.ln1 = RMSNorm(d_model, eps, device=device, dtype=dtype)  # Before attention
-        self.ln2 = RMSNorm(d_model, eps, device=device, dtype=dtype)  # Before FFN
-        
-        # Multi-head self-attention with RoPE support
-        self.attn = MultiHeadSelfAttention(
-            d_model, num_heads, max_seq_len=max_seq_len, 
-            theta=theta, use_rope=use_rope, device=device, dtype=dtype
-        )
-        
-        # Feed-forward network (SwiGLU)
-        self.ffn = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
-    
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        """
-        Apply pre-norm transformer block
-        
-        Args:
-            x: Input tensor of shape (batch_size, seq_len, d_model)
-            mask: Optional attention mask
-            
-        Returns:
-            Output tensor of shape (batch_size, seq_len, d_model)
-        """
-        # Pre-norm attention sublayer
-        # x -> LayerNorm -> Attention -> Residual
-        norm_x = self.ln1(x)
-        attn_output = self.attn(norm_x, mask)
-        x = x + attn_output  # Residual connection
-        
-        # Pre-norm feed-forward sublayer  
-        # x -> LayerNorm -> FFN -> Residual
-        norm_x = self.ln2(x)
-        ffn_output = self.ffn(norm_x)
-        x = x + ffn_output   # Residual connection
-        
-        return x
-
-
-class TransformerLM(nn.Module):
-    """Transformer Language Model
-    
-    A complete autoregressive language model following the GPT architecture:
-    1. Token embeddings
-    2. Multiple Transformer blocks
-    3. Final layer norm
-    4. Output projection to vocabulary
-    """
-    
-    def __init__(
-        self,
-        vocab_size: int,
-        context_length: int,
-        d_model: int,
-        num_heads: int,
-        d_ff: int,
-        num_layers: int,
-        eps: float = 1e-5,
-        device=None,
-        dtype=None
-    ):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.context_length = context_length
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.d_ff = d_ff
-        self.num_layers = num_layers
-        
-        # Token embeddings
-        self.token_embedding = Embedding(vocab_size, d_model, device=device, dtype=dtype)
-        
-        # Transformer blocks
-        self.blocks = nn.ModuleList([
-            TransformerBlock(
-                d_model, num_heads, d_ff, eps, 
-                max_seq_len=context_length, theta=10000.0, use_rope=True,
-                device=device, dtype=dtype
-            )
-            for _ in range(num_layers)
-        ])
-        
-        # Final layer normalization
-        self.ln_final = RMSNorm(d_model, eps, device=device, dtype=dtype)
-        
-        # Output projection to vocabulary (language modeling head)
-        self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype)
-    
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
-        """
-        Forward pass of the Transformer Language Model
-        
-        Args:
-            input_ids: Token IDs of shape (batch_size, seq_len)
-            attention_mask: Optional attention mask of shape (seq_len, seq_len) or (batch_size, seq_len, seq_len)
-            
-        Returns:
-            Logits over vocabulary of shape (batch_size, seq_len, vocab_size)
-        """
-        batch_size, seq_len = input_ids.shape
-        
-        # Token embeddings
-        x = self.token_embedding(input_ids)  # (batch_size, seq_len, d_model)
-        
-        # Apply transformer blocks
-        for block in self.blocks:
-            x = block(x, mask=attention_mask)  # Each block applies causal masking
-        
-        # Final layer norm
-        x = self.ln_final(x)  # (batch_size, seq_len, d_model)
-        
-        # Language modeling head
-        logits = self.lm_head(x)  # (batch_size, seq_len, vocab_size)
-        
-        return logits
-
 
 def run_linear(d_in, d_out, weights, in_features) -> Float[Tensor, "..."]:
     """
@@ -506,7 +23,7 @@ def run_linear(d_in, d_out, weights, in_features) -> Float[Tensor, "..."]:
         in_features (Float[Tensor, "..."]): Input features
     """
     # Create a linear layer
-    linear_layer = Linear(d_in, d_out)
+    linear_layer = linear.Linear(d_in, d_out)
     
     # Load the provided weights using state_dict
     state_dict = {'weight': weights}
@@ -514,7 +31,6 @@ def run_linear(d_in, d_out, weights, in_features) -> Float[Tensor, "..."]:
     
     # Run forward pass
     return linear_layer(in_features)
-
 
 def run_embedding(vocab_size: int, d_model: int, weights: Float[Tensor, "vocab_size d_model"], token_ids: Int[Tensor, "..."]) -> Float[Tensor, "... d_model"]:
     """
@@ -530,7 +46,7 @@ def run_embedding(vocab_size: int, d_model: int, weights: Float[Tensor, "vocab_s
         Float[Tensor, "... d_model"]: Batch of embeddings returned by the Embedding layer.
     """
     # Create an embedding layer
-    embedding_layer = Embedding(vocab_size, d_model) # the matrix is (vocab_size, d_model)
+    embedding_layer = embedding.Embedding(vocab_size, d_model) # the matrix is (vocab_size, d_model)
     
     # Load the provided weights using state_dict
     state_dict = {'weight': weights}
@@ -538,7 +54,6 @@ def run_embedding(vocab_size: int, d_model: int, weights: Float[Tensor, "vocab_s
     
     # Run forward pass
     return embedding_layer(token_ids)
-
 
 def run_rmsnorm(d_model: int, eps: float, weights: Float[Tensor, "d_model"], in_features: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
     """
@@ -554,7 +69,7 @@ def run_rmsnorm(d_model: int, eps: float, weights: Float[Tensor, "d_model"], in_
         Float[Tensor, "... d_model"]: Tensor with the output of running RMSNorm
     """
     # Create RMSNorm layer
-    rmsnorm_layer = RMSNorm(d_model, eps)
+    rmsnorm_layer = rmsnorm.RMSNorm(d_model, eps)
     
     # Load the provided weights using state_dict
     state_dict = {'weight': weights}
@@ -563,10 +78,11 @@ def run_rmsnorm(d_model: int, eps: float, weights: Float[Tensor, "d_model"], in_
     # Run forward pass
     return rmsnorm_layer(in_features)
 
-
 def run_silu(in_features: Float[Tensor, "..."]) -> Float[Tensor, "..."]:
     """
     Apply SiLU (Swish) activation function to the input features.
+    
+    SiLU(x) = x * sigmoid(x)
 
     Args:
         in_features (Float[Tensor, "..."]): Input features to run SiLU on
@@ -574,9 +90,7 @@ def run_silu(in_features: Float[Tensor, "..."]) -> Float[Tensor, "..."]:
     Returns:
         Float[Tensor, "..."]: Tensor with SiLU applied element-wise
     """
-    return torch.nn.functional.silu(in_features)
-
-
+    return in_features * torch.sigmoid(in_features)
 def run_swiglu(d_model: int, d_ff: int, w1_weight: Float[Tensor, "d_ff d_model"], w2_weight: Float[Tensor, "d_model d_ff"], w3_weight: Float[Tensor, "d_ff d_model"], in_features: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
     """
     Run SwiGLU with the given weights and input features.
@@ -593,7 +107,7 @@ def run_swiglu(d_model: int, d_ff: int, w1_weight: Float[Tensor, "d_ff d_model"]
         Float[Tensor, "... d_model"]: Output embeddings of the same shape as input
     """
     # Create SwiGLU layer
-    swiglu_layer = SwiGLU(d_model, d_ff)
+    swiglu_layer = swiglu.SwiGLU(d_model, d_ff)
     
     # Load the provided weights using state_dict
     state_dict = {
@@ -626,45 +140,9 @@ def run_rope(
     Returns:
         Tensor with RoPE applied
     """
-    rope = RotaryPositionEmbedding(theta, d_k, max_seq_len, device=in_query_or_key.device)
+    ropeOutput = rope.RotaryPositionEmbedding(theta, d_k, max_seq_len, device=in_query_or_key.device)
     # Apply RoPE
-    return rope(in_query_or_key, token_positions)
-
-def run_softmax(in_features: Float[Tensor, "..."], dim: int) -> Float[Tensor, "..."]:
-    """
-    Apply softmax to the specified dimension of the input tensor.
-    
-    Uses the numerical stability trick of subtracting the maximum value
-    to avoid overflow in the exponential function.
-    
-    Softmax formula: softmax(x_i) = exp(x_i - max(x)) / sum(exp(x_j - max(x)))
-
-    Args:
-        in_features (Float[Tensor, "..."]): Input features to softmax
-        dim (int): Dimension to apply softmax to
-    
-    Returns:
-        Float[Tensor, "..."]: Tensor with softmax applied to the specified dimension
-    """
-    # Step 1: Find the maximum value along the specified dimension
-    # keepdim=True maintains the dimension for broadcasting
-    max_vals = torch.max(in_features, dim=dim, keepdim=True)[0]
-    
-    # Step 2: Subtract max for numerical stability
-    # This prevents overflow when computing exp(large_number)
-    shifted = in_features - max_vals
-    
-    # Step 3: Compute exponentials
-    exp_vals = torch.exp(shifted)
-    
-    # Step 4: Compute sum of exponentials along the specified dimension
-    sum_exp = torch.sum(exp_vals, dim=dim, keepdim=True)
-    
-    # Step 5: Normalize to get probabilities
-    softmax_output = exp_vals / sum_exp
-    
-    return softmax_output
-
+    return ropeOutput(in_query_or_key, token_positions)
 
 def run_scaled_dot_product_attention(
         Q: Float[Tensor, "... queries d_k"],
@@ -686,7 +164,7 @@ def run_scaled_dot_product_attention(
     Returns:
         Attention output tensor
     """
-    return scaled_dot_product_attention(Q, K, V, mask)
+    return attention.scaled_dot_product_attention(Q, K, V, mask)
 
 
 def run_multihead_self_attention(
@@ -714,7 +192,7 @@ def run_multihead_self_attention(
         Multi-head attention output
     """
     # Create multi-head attention layer (without RoPE for this adapter)
-    mha_layer = MultiHeadSelfAttention(d_model, num_heads, use_rope=False)
+    mha_layer = mha.MultiHeadSelfAttention(d_model, num_heads, use_rope=False)
     
     # Load the provided weights using state_dict
     state_dict = {
@@ -760,7 +238,7 @@ def run_multihead_self_attention_with_rope(
         Multi-head attention output with RoPE applied
     """
     # Create multi-head attention layer with RoPE
-    mha_layer = MultiHeadSelfAttention(
+    mha_layer = mha.MultiHeadSelfAttention(
         d_model=d_model, 
         num_heads=num_heads,
         max_seq_len=max_seq_len,
@@ -779,33 +257,6 @@ def run_multihead_self_attention_with_rope(
     
     # Run forward pass with RoPE
     return mha_layer(in_features, token_positions=token_positions)
-
-
-def run_rope(
-        d_k: int,
-        theta: float,
-        max_seq_len: int,
-        in_query_or_key: Float[Tensor, "... sequence_length d_k"],
-        token_positions: Int[Tensor, "... sequence_length"],
-    ) -> Float[Tensor, "... sequence_length d_k"]:
-    """
-    Run RoPE for a given input tensor.
-    
-    Args:
-        d_k: Embedding dimension size for the query or key tensor
-        theta: RoPE parameter
-        max_seq_len: Maximum sequence length to pre-cache
-        in_query_or_key: Input tensor to run RoPE on
-        token_positions: Tensor with the token positions
-        
-    Returns:
-        Tensor with RoPE applied
-    """
-    # Create RoPE module
-    rope = RotaryPositionEmbedding(theta, d_k, max_seq_len, device=in_query_or_key.device)
-    
-    # Apply RoPE
-    return rope(in_query_or_key, token_positions)
 
 
 def run_transformer_block(
@@ -833,7 +284,7 @@ def run_transformer_block(
         Transformer block output
     """
     # Create transformer block with RoPE
-    block = TransformerBlock(
+    block = transformer.TransformerBlock(
         d_model, num_heads, d_ff, 
         max_seq_len=max_seq_len, theta=theta, use_rope=True
     )
@@ -884,7 +335,7 @@ def run_transformer_lm(
         Logits over vocabulary
     """
     # Create transformer language model
-    model = TransformerLM(
+    model = transformer.TransformerLM(
         vocab_size=vocab_size,
         context_length=context_length,
         d_model=d_model,
@@ -915,120 +366,11 @@ def run_transformer_lm(
     # Run forward pass
     return model(input_ids)
 
-def cross_entropy_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    """
-    Compute cross-entropy loss between logits and targets with numerical stability.
-    Cross-entropy loss formula: ℓ_i = -log(softmax(o_i)[x_{i+1}])
 
-    Args:
-        logits: Unnormalized logits of shape (..., vocab_size)
-        targets: Target class indices of shape (...)
-        
-    Returns:
-        Average cross-entropy loss across all examples (scalar)
-    """
-    # Get the shape information
-    *batch_dims, vocab_size = logits.shape
-    batch_size = logits.numel() // vocab_size
-    # Flatten to (batch_size, vocab_size) for easier processing
-    logits_flat = logits.view(batch_size, vocab_size)
-    targets_flat = targets.view(batch_size)
-
-    # step 1: substract max for numerical stability
-    # max_logits shape: (batch_size, 1)
-    max_logits = torch.max(logits_flat, dim=1, keepdim=True)[0]
-    logits_stable = logits_flat - max_logits
-
-    # step 2: compute log softmax
-    # log_softmax(x_i) = x_i - max(x) - log(sum(exp(x_j - max(x))))
-    exp_logits = torch.exp(logits_stable)
-    sum_exp = torch.sum(exp_logits, dim=1, keepdim=True)
-    log_sum_exp = torch.log(sum_exp)
-
-    # log_softmax = logits_stable - log_sum_exp
-    log_softmax = logits_stable - log_sum_exp
-
-    # step 3: gather the log probabilities of the targets
-    # use advanced indexing to get log_softmax[i, targets[i]] for each i
-    target_log_probs = log_softmax[torch.arange(batch_size), targets_flat]
-
-    # step 4: compute negative log likelihood loss
-    losses = -target_log_probs
-
-    return torch.mean(losses)
-
-
-def gradient_clipping(parameters, max_l2_norm:float) -> None:
-    """
-    clip gradients to have L2 norm at most max_l2_norm.
-
-    This prevents gradient explosion by scaling down gradients when their
-    combined L2 norm exceeds the threshold.
-
-    Args:
-        parmeters: Iterable of parameters with .grad attributes
-        max_l2_norm: Max allowed L2 norm of gradients
-    """
-    # Collect all gradients
-    gradients = []
-    for param in parameters:
-        if param.grad is not None:
-            gradients.append(param.grad.view(-1)) # Flatten each gradient
-    
-    if not gradients:
-        return # No gradients ot clip
-    
-    # Concatenate all gradients into a single vector
-    all_gradients = torch.cat(gradients)
-
-    # Compute L2 norm of all gradients combined
-    # global l2 norm: sqrt(sum(g_i^2))
-    total_norm = torch.norm(all_gradients, p=2)
-
-    # Compute clipping factor (i.e. scaling factor)
-    clip_factor = max_l2_norm / (total_norm + 1e-8) # Add small epsilon to avoid division by zero
-
-    # only clip if the norm exceeds the threshold
-    if clip_factor < 1.0:
-        # Scale down all gradients by the same factor
-        # only change the gradient's magnitude, without changing the direction
-        for param in parameters:
-            if param.grad is not None:
-                param.grad.data.mul_(clip_factor)
-
-def get_lr_cosine_schedule(
-        it: int,
-        max_learning_rate: float,
-        min_learning_rate: float,
-        warmup_iters: int,
-        cosine_cycle_iters: int,
-    ) -> float:
-    """
-    Cosine learning rate schedule with linear warmup.
-    
-    The schedule has three phases:
-    1. Linear warmup: [0, warmup_iters) - linearly increase from 0 to max_lr
-    2. Cosine annealing: [warmup_iters, cosine_cycle_iters) - 
-       cosine decay from max_lr to min_lr
-    3. Constant: [cosine_cycle_iters, inf) - stay at min_lr
-    
-    Args:
-        it: Current iteration number
-        max_learning_rate: α_max, maximum learning rate
-        min_learning_rate: α_min, minimum learning rate
-        warmup_iters: T_w, number of warmup iterations
-        cosine_cycle_iters: T_c, number of cosine annealing iterations
-        
-    Returns:
-        Learning rate at iteration it
-    """
-    import math
-    # p1: linear warmup
-    if it < warmup_iters:
-        return max_learning_rate * it / warmup_iters
-    elif it < cosine_cycle_iters:
-        progress = (it - warmup_iters) / (cosine_cycle_iters - warmup_iters)
-        cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
-        return min_learning_rate + (max_learning_rate - min_learning_rate) * cosine_factor
-    else:
-        return min_learning_rate
+# Training utilities moved to cs336_basics/training_utils.py
+# - cross_entropy_loss
+# - gradient_clipping  
+# - get_lr_cosine_schedule
+# - get_batch
+# - save_checkpoint
+# - load_checkpoint
