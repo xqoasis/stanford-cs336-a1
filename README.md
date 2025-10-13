@@ -48,3 +48,34 @@ gunzip owt_valid.txt.gz
 cd ..
 ```
 
+## Training
+
+### Quick Start
+
+To train a Transformer language model, use the provided training script:
+
+```bash
+# Basic usage (always use 'uv run')
+uv run python train.py \
+    --train_data data/train.npy \
+    --vocab_size 10000 \
+    --max_iters 1000
+
+
+**⚠️ Important**: This project uses `uv` for dependency management. Always use `uv run python` instead of just `python`.
+
+### Documentation
+
+- **[TRAINING.md](TRAINING.md)** - Complete training guide with examples, parameters, and implementation details
+
+### Key Features
+
+**Configurable hyperparameters** via command-line arguments  
+**Memory-efficient data loading** with `np.memmap`  
+**Checkpoint management** for saving and resuming training  
+**Performance monitoring** with console logging and optional W&B integration  
+**Learning rate scheduling** with cosine annealing and warmup  
+**Gradient clipping** for training stability  
+
+See [TRAINING.md](TRAINING.md) for detailed usage instructions.
+

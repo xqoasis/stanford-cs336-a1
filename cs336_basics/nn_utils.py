@@ -365,12 +365,3 @@ def run_transformer_lm(
     
     # Run forward pass
     return model(input_ids)
-
-
-# Training utilities moved to cs336_basics/training_utils.py
-# - cross_entropy_loss
-# - gradient_clipping  
-# - get_lr_cosine_schedule
-# - get_batch
-# - save_checkpoint
-# - load_checkpoint
